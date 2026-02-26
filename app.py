@@ -60,13 +60,13 @@ def tazapay_headers():
 
 def tazapay_get(path: str) -> dict:
     url = f"{TAZAPAY_BASE_URL}{path}"
-    resp = requests.get(url, headers=tazapay_headers(), timeout=15)
+    resp = requests.get(url, headers=tazapay_headers(), timeout=15, verify=False)
     resp.raise_for_status()
     return resp.json()
 
 def tazapay_post(path: str, payload: dict) -> dict:
     url = f"{TAZAPAY_BASE_URL}{path}"
-    resp = requests.post(url, headers=tazapay_headers(), json=payload, timeout=15)
+    resp = requests.post(url, headers=tazapay_headers(), json=payload, timeout=15, verify=False)
     resp.raise_for_status()
     return resp.json()
 
@@ -158,16 +158,29 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
     try:
         if tool_name == "check_balance":
             currency = tool_input.get("currency", "").upper()
-            data = tazapay_get("/v2/balance" + (f"?currency={currency}" if currency else ""))
-            balances = data.get("data", {}).get("balances", data.get("data", data))
-            if isinstance(balances, dict):
-                lines = [f"{k}: {v}" for k, v in balances.items() if float(v or 0) != 0]
-                zero = [k for k, v in balances.items() if float(v or 0) == 0]
-                result = "Active balances:\n" + "\n".join(lines)
-                if zero:
-                    result += f"\n\nZero balance currencies: {', '.join(zero)}"
+            # Try multiple possible endpoint paths
+            for path in ["/v2/balance", "/v1/balance", "/v2/account/balance"]:
+                try:
+                    data = tazapay_get(path + (f"?currency={currency}" if currency else ""))
+                    break
+                except Exception:
+                    continue
+            # Parse response — handle various response shapes
+            raw = data.get("data", data)
+            if isinstance(raw, dict) and "balances" in raw:
+                raw = raw["balances"]
+            if isinstance(raw, dict):
+                active = {k: v for k, v in raw.items() if float(v or 0) != 0}
+                zero = [k for k, v in raw.items() if float(v or 0) == 0]
+                if active:
+                    lines = [f"{k}: {v}" for k, v in active.items()]
+                    result = "Active balances:\n" + "\n".join(lines)
+                    if zero:
+                        result += f"\nZero: {', '.join(zero)}"
+                else:
+                    result = "All balances are zero."
             else:
-                result = str(balances)
+                result = str(raw)
             return result
 
         elif tool_name == "get_fx_rate":
@@ -175,8 +188,9 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             tc = tool_input["to_currency"].upper()
             amt = int(tool_input["amount"])
             data = tazapay_get(f"/v2/fx?from={fc}&to={tc}&amount={amt}")
-            rate = data.get("data", {}).get("rate") or data.get("rate")
-            converted = data.get("data", {}).get("converted_amount") or data.get("converted_amount")
+            raw = data.get("data", data)
+            rate = raw.get("rate") if isinstance(raw, dict) else data.get("rate")
+            converted = raw.get("converted_amount") if isinstance(raw, dict) else data.get("converted_amount")
             return f"FX Rate: 1 {fc} = {rate} {tc}\n{amt} {fc} = {converted} {tc}"
 
         elif tool_name == "create_payment_link":
@@ -193,12 +207,9 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 "cancel_url": "https://tazapay.com/cancel",
             }
             data = tazapay_post("/v2/session/checkout", payload)
-            url = (
-                data.get("data", {}).get("url")
-                or data.get("data", {}).get("payment_url")
-                or data.get("url")
-            )
-            session_id = data.get("data", {}).get("id") or data.get("id", "N/A")
+            raw = data.get("data", data)
+            url = raw.get("url") or raw.get("payment_url") or raw.get("checkout_url", "N/A")
+            session_id = raw.get("id", "N/A")
             return f"Payment link created!\nURL: {url}\nSession ID: {session_id}"
 
         elif tool_name == "check_payout_status":
