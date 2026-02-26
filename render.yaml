@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: tazapay-whatsapp-poc
+    runtime: python
+    region: singapore   # closest to Tazapay's primary markets
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --bind 0.0.0.0:$PORT --timeout 60
+    healthCheckPath: /health
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false       # set manually in Render dashboard
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_NUMBER
+        value: whatsapp:+14155238886
+      - key: TAZAPAY_API_KEY
+        sync: false
+      - key: TAZAPAY_API_SECRET
+        sync: false
+      - key: TAZAPAY_BASE_URL
+        value: https://api.tazapay.com
+      - key: AUTHORIZED_NUMBERS
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.0"
