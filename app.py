@@ -11,6 +11,8 @@ from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 import anthropic
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -158,13 +160,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
     try:
         if tool_name == "check_balance":
             currency = tool_input.get("currency", "").upper()
-            # Try multiple possible endpoint paths
-            for path in ["/v2/balance", "/v1/balance", "/v2/account/balance"]:
-                try:
-                    data = tazapay_get(path + (f"?currency={currency}" if currency else ""))
-                    break
-                except Exception:
-                    continue
+            data = tazapay_get("/v2/balance" + (f"?currency={currency}" if currency else ""))
             # Parse response — handle various response shapes
             raw = data.get("data", data)
             if isinstance(raw, dict) and "balances" in raw:
