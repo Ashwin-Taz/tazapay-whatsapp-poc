@@ -35,7 +35,7 @@ TAZAPAY_API_SECRET     = os.getenv("TAZAPAY_API_SECRET", "")
 # Use sandbox URL for testing, live URL for production
 # Sandbox: https://service-sandbox.tazapay.com
 # Live:    https://service.tazapay.com
-TAZAPAY_BASE_URL       = os.getenv("TAZAPAY_BASE_URL", "https://service-sandbox.tazapay.com")
+TAZAPAY_BASE_URL       = os.getenv("TAZAPAY_BASE_URL", "https://service.tazapay.com")
 AUTHORIZED_NUMBERS     = [n.strip() for n in os.getenv("AUTHORIZED_NUMBERS", "").split(",") if n.strip()]
 
 # ---------------------------------------------------------------------------
