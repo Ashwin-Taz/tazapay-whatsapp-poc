@@ -6,69 +6,59 @@ WhatsApp (Twilio) → Flask webhook → Claude AI + Tazapay tools → WhatsApp r
 
 import os
 import json
+import hmac
+import hashlib
+import datetime
 import logging
+import requests
+import urllib3
+
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
 import anthropic
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Config (set via environment variables or .env)
+# Config
 # ---------------------------------------------------------------------------
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")  # Twilio sandbox default
-TAZAPAY_API_KEY = os.getenv("TAZAPAY_API_KEY", "")
-TAZAPAY_API_SECRET = os.getenv("TAZAPAY_API_SECRET", "")
-TAZAPAY_BASE_URL = os.getenv("TAZAPAY_BASE_URL", "https://api.tazapay.com")
-
-# Authorized WhatsApp numbers (E.164 format, e.g. whatsapp:+6512345678)
-# Leave empty to allow all numbers during POC
-AUTHORIZED_NUMBERS = os.getenv("AUTHORIZED_NUMBERS", "").split(",") if os.getenv("AUTHORIZED_NUMBERS") else []
+ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
+TWILIO_ACCOUNT_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+TAZAPAY_API_KEY      = os.getenv("TAZAPAY_API_KEY", "")
+TAZAPAY_API_SECRET   = os.getenv("TAZAPAY_API_SECRET", "")
+TAZAPAY_BASE_URL     = os.getenv("TAZAPAY_BASE_URL", "https://service-sandbox.tazapay.com")
+AUTHORIZED_NUMBERS   = [n.strip() for n in os.getenv("AUTHORIZED_NUMBERS", "").split(",") if n.strip()]
 
 # ---------------------------------------------------------------------------
-# In-memory conversation history (per phone number)
+# In-memory conversation store
 # ---------------------------------------------------------------------------
-conversation_store: dict[str, list] = {}
+conversation_store: dict = {}
 
 # ---------------------------------------------------------------------------
-# Tazapay API helpers
+# Tazapay API helpers — Basic Auth (API_KEY:API_SECRET base64 encoded)
 # ---------------------------------------------------------------------------
-import requests
-import base64
-import hashlib
-import hmac
-import time
-
-def tazapay_headers():
-    """Generate Tazapay API authentication headers."""
-    timestamp = str(int(time.time()))
-    message = timestamp + TAZAPAY_API_KEY
-    signature = hmac.new(
-        TAZAPAY_API_SECRET.encode(), message.encode(), hashlib.sha256
-    ).hexdigest()
-    return {
-        "Authorization": f"Basic {base64.b64encode(f'{TAZAPAY_API_KEY}:{TAZAPAY_API_SECRET}'.encode()).decode()}",
-        "Content-Type": "application/json",
-    }
-
 def tazapay_get(path: str) -> dict:
     url = f"{TAZAPAY_BASE_URL}{path}"
-    resp = requests.get(url, headers=tazapay_headers(), timeout=15, verify=False)
+    resp = requests.get(url, auth=(TAZAPAY_API_KEY, TAZAPAY_API_SECRET),
+                        headers={"Content-Type": "application/json"},
+                        timeout=15, verify=False)
+    logger.info(f"Tazapay GET {path} → {resp.status_code}: {resp.text[:300]}")
     resp.raise_for_status()
     return resp.json()
 
 def tazapay_post(path: str, payload: dict) -> dict:
     url = f"{TAZAPAY_BASE_URL}{path}"
-    resp = requests.post(url, headers=tazapay_headers(), json=payload, timeout=15, verify=False)
+    resp = requests.post(url, auth=(TAZAPAY_API_KEY, TAZAPAY_API_SECRET),
+                         json=payload,
+                         headers={"Content-Type": "application/json"},
+                         timeout=15, verify=False)
+    logger.info(f"Tazapay POST {path} → {resp.status_code}: {resp.text[:300]}")
     resp.raise_for_status()
     return resp.json()
 
@@ -78,18 +68,11 @@ def tazapay_post(path: str, payload: dict) -> dict:
 TOOLS = [
     {
         "name": "check_balance",
-        "description": (
-            "Fetch the merchant's Tazapay wallet balances. "
-            "Optionally filter by a specific currency (e.g. USD, SGD). "
-            "Returns all balances if no currency is specified."
-        ),
+        "description": "Fetch the merchant's Tazapay wallet balances. Optionally filter by currency (e.g. USD). Returns all balances if no currency specified.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "currency": {
-                    "type": "string",
-                    "description": "Optional 3-letter ISO currency code (e.g. USD). Leave empty for all balances.",
-                }
+                "currency": {"type": "string", "description": "Optional 3-letter ISO currency code e.g. USD"}
             },
             "required": [],
         },
@@ -100,9 +83,9 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "from_currency": {"type": "string", "description": "Source currency (e.g. USD)"},
-                "to_currency": {"type": "string", "description": "Target currency (e.g. INR)"},
-                "amount": {"type": "number", "description": "Amount in source currency"},
+                "from_currency": {"type": "string"},
+                "to_currency":   {"type": "string"},
+                "amount":        {"type": "number"},
             },
             "required": ["from_currency", "to_currency", "amount"],
         },
@@ -113,63 +96,52 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "customer_name": {"type": "string"},
-                "customer_email": {"type": "string"},
+                "customer_name":    {"type": "string"},
+                "customer_email":   {"type": "string"},
                 "customer_country": {"type": "string", "description": "ISO alpha-2 country code"},
-                "amount": {"type": "number"},
-                "currency": {"type": "string", "description": "Invoice currency (e.g. USD)"},
-                "description": {"type": "string"},
+                "amount":           {"type": "number"},
+                "currency":         {"type": "string"},
+                "description":      {"type": "string"},
             },
             "required": ["customer_name", "customer_email", "customer_country", "amount", "currency", "description"],
         },
     },
     {
         "name": "check_payout_status",
-        "description": "Check the status of a Tazapay payout by its ID.",
+        "description": "Check the status of a Tazapay payout by its ID (starts with po_).",
         "input_schema": {
             "type": "object",
             "properties": {
-                "payout_id": {"type": "string", "description": "Tazapay payout ID (starts with po_)"},
+                "payout_id": {"type": "string"},
             },
             "required": ["payout_id"],
         },
     },
 ]
 
-SYSTEM_PROMPT = """You are a Tazapay payment assistant for merchants, accessible via WhatsApp.
-
-You help merchants with:
-1. Checking their Tazapay wallet balances
-2. Getting FX rates between currencies
-3. Creating payment links to collect funds from customers
-4. Checking payout statuses
-
-Keep responses concise and WhatsApp-friendly (no markdown, use plain text and emojis sparingly).
-Always confirm important details before taking action.
-If a request is ambiguous, ask a clarifying question.
-For payment links, always confirm the details before creating.
-
-Format numbers clearly: use commas for thousands, 2 decimal places for amounts.
-"""
+SYSTEM_PROMPT = """You are a Tazapay payment assistant for merchants on WhatsApp.
+You help with: checking balances, FX rates, creating payment links, and checking payout statuses.
+Keep responses concise and WhatsApp-friendly (plain text, no markdown).
+Always confirm key details before creating payment links.
+Format numbers clearly with commas and 2 decimal places."""
 
 # ---------------------------------------------------------------------------
 # Tool executor
 # ---------------------------------------------------------------------------
-def execute_tool(tool_name: str, tool_input: dict) -> str:
-    logger.info(f"Executing tool: {tool_name} with input: {tool_input}")
+def execute_tool(name: str, inp: dict) -> str:
+    logger.info(f"Tool: {name} | Input: {inp}")
     try:
-        if tool_name == "check_balance":
-            currency = tool_input.get("currency", "").upper()
-            data = tazapay_get("/v2/balance" + (f"?currency={currency}" if currency else ""))
-            # Parse response — handle various response shapes
+        if name == "check_balance":
+            currency = inp.get("currency", "").upper()
+            data = tazapay_get("/v3/balance" + (f"?currency={currency}" if currency else ""))
             raw = data.get("data", data)
             if isinstance(raw, dict) and "balances" in raw:
                 raw = raw["balances"]
             if isinstance(raw, dict):
                 active = {k: v for k, v in raw.items() if float(v or 0) != 0}
-                zero = [k for k, v in raw.items() if float(v or 0) == 0]
+                zero   = [k for k, v in raw.items() if float(v or 0) == 0]
                 if active:
-                    lines = [f"{k}: {v}" for k, v in active.items()]
+                    lines  = [f"{k}: {v}" for k, v in active.items()]
                     result = "Active balances:\n" + "\n".join(lines)
                     if zero:
                         result += f"\nZero: {', '.join(zero)}"
@@ -179,74 +151,63 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 result = str(raw)
             return result
 
-        elif tool_name == "get_fx_rate":
-            fc = tool_input["from_currency"].upper()
-            tc = tool_input["to_currency"].upper()
-            amt = int(tool_input["amount"])
-            data = tazapay_get(f"/v2/fx?from={fc}&to={tc}&amount={amt}")
-            raw = data.get("data", data)
-            rate = raw.get("rate") if isinstance(raw, dict) else data.get("rate")
+        elif name == "get_fx_rate":
+            fc, tc, amt = inp["from_currency"].upper(), inp["to_currency"].upper(), int(inp["amount"])
+            data = tazapay_get(f"/v3/fx?from={fc}&to={tc}&amount={amt}")
+            raw  = data.get("data", data)
+            rate      = raw.get("rate") if isinstance(raw, dict) else data.get("rate")
             converted = raw.get("converted_amount") if isinstance(raw, dict) else data.get("converted_amount")
             return f"FX Rate: 1 {fc} = {rate} {tc}\n{amt} {fc} = {converted} {tc}"
 
-        elif tool_name == "create_payment_link":
+        elif name == "create_payment_link":
             payload = {
                 "customer_details": {
-                    "name": tool_input["customer_name"],
-                    "email": tool_input["customer_email"],
-                    "country": tool_input["customer_country"],
+                    "name": inp["customer_name"],
+                    "email": inp["customer_email"],
+                    "country": inp["customer_country"],
                 },
-                "invoice_currency": tool_input["currency"].upper(),
-                "amount": tool_input["amount"],
-                "transaction_description": tool_input["description"],
+                "invoice_currency": inp["currency"].upper(),
+                "amount": inp["amount"],
+                "transaction_description": inp["description"],
                 "success_url": "https://tazapay.com/success",
-                "cancel_url": "https://tazapay.com/cancel",
+                "cancel_url":  "https://tazapay.com/cancel",
             }
-            data = tazapay_post("/v2/session/checkout", payload)
-            raw = data.get("data", data)
-            url = raw.get("url") or raw.get("payment_url") or raw.get("checkout_url", "N/A")
-            session_id = raw.get("id", "N/A")
-            return f"Payment link created!\nURL: {url}\nSession ID: {session_id}"
+            data = tazapay_post("/v3/session/checkout", payload)
+            raw  = data.get("data", data)
+            url  = raw.get("url") or raw.get("payment_url") or raw.get("checkout_url", "N/A")
+            sid  = raw.get("id", "N/A")
+            return f"Payment link created!\nURL: {url}\nSession ID: {sid}"
 
-        elif tool_name == "check_payout_status":
-            payout_id = tool_input["payout_id"]
-            data = tazapay_get(f"/v2/payout/{payout_id}")
-            payout = data.get("data", data)
-            status = payout.get("status", "unknown")
-            amount = payout.get("amount", "N/A")
-            currency = payout.get("currency", "")
-            beneficiary = payout.get("beneficiary_name") or payout.get("beneficiary", {}).get("name", "N/A")
-            created = payout.get("created_at", "N/A")
+        elif name == "check_payout_status":
+            pid  = inp["payout_id"]
+            data = tazapay_get(f"/v3/payout/{pid}")
+            p    = data.get("data", data)
             return (
-                f"Payout {payout_id}\n"
-                f"Status: {status.upper()}\n"
-                f"Amount: {amount} {currency}\n"
-                f"Beneficiary: {beneficiary}\n"
-                f"Created: {created}"
+                f"Payout {pid}\n"
+                f"Status: {p.get('status','unknown').upper()}\n"
+                f"Amount: {p.get('amount','N/A')} {p.get('currency','')}\n"
+                f"Beneficiary: {p.get('beneficiary_name', p.get('beneficiary',{}).get('name','N/A'))}\n"
+                f"Created: {p.get('created_at','N/A')}"
             )
-
         else:
-            return f"Unknown tool: {tool_name}"
+            return f"Unknown tool: {name}"
 
     except requests.HTTPError as e:
-        logger.error(f"Tazapay API error: {e.response.text}")
-        return f"Tazapay API error: {e.response.status_code} - {e.response.text[:200]}"
+        logger.error(f"Tazapay HTTP error: {e.response.status_code} {e.response.text[:300]}")
+        return f"Tazapay API error {e.response.status_code}: {e.response.text[:200]}"
     except Exception as e:
         logger.error(f"Tool error: {e}")
-        return f"Error executing {tool_name}: {str(e)}"
+        return f"Error: {str(e)}"
 
 # ---------------------------------------------------------------------------
 # Claude agentic loop
 # ---------------------------------------------------------------------------
-def run_claude(phone_number: str, user_message: str) -> str:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+def run_claude(phone: str, message: str) -> str:
+    client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    history = conversation_store.get(phone, [])
+    history.append({"role": "user", "content": message})
 
-    # Get or init conversation history
-    history = conversation_store.get(phone_number, [])
-    history.append({"role": "user", "content": user_message})
-
-    max_iterations = 5
-    for _ in range(max_iterations):
+    for _ in range(5):
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1024,
@@ -254,71 +215,48 @@ def run_claude(phone_number: str, user_message: str) -> str:
             tools=TOOLS,
             messages=history,
         )
-
-        # Add assistant response to history
         history.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "end_turn":
-            # Extract text response
-            text = " ".join(
-                block.text for block in response.content if hasattr(block, "text")
-            )
-            conversation_store[phone_number] = history[-20:]  # Keep last 20 turns
+            text = " ".join(b.text for b in response.content if hasattr(b, "text"))
+            conversation_store[phone] = history[-20:]
             return text.strip()
 
         elif response.stop_reason == "tool_use":
-            # Execute all tool calls
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    result = execute_tool(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
-
-            history.append({"role": "user", "content": tool_results})
-
+            results = []
+            for b in response.content:
+                if b.type == "tool_use":
+                    result = execute_tool(b.name, b.input)
+                    results.append({"type": "tool_result", "tool_use_id": b.id, "content": result})
+            history.append({"role": "user", "content": results})
         else:
             break
 
-    conversation_store[phone_number] = history[-20:]
+    conversation_store[phone] = history[-20:]
     return "Sorry, I couldn't complete that request. Please try again."
 
 # ---------------------------------------------------------------------------
-# Webhook endpoint
+# Webhook
 # ---------------------------------------------------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     from_number = request.form.get("From", "")
-    body = request.form.get("Body", "").strip()
-
+    body        = request.form.get("Body", "").strip()
     logger.info(f"Incoming message from {from_number}: {body}")
 
-    # Authorization check
     if AUTHORIZED_NUMBERS and from_number not in AUTHORIZED_NUMBERS:
-        logger.warning(f"Unauthorized number: {from_number}")
         resp = MessagingResponse()
-        resp.message("Sorry, you are not authorized to use this service.")
+        resp.message("Sorry, you are not authorized.")
         return str(resp)
 
-    if not body:
-        resp = MessagingResponse()
-        resp.message("Hi! I'm your Tazapay assistant. You can ask me to:\n- Check balance\n- Get FX rate\n- Create payment link\n- Check payout status")
-        return str(resp)
-
-    # Handle reset command
-    if body.lower() in ["/reset", "reset", "clear"]:
+    if not body or body.lower() in ["reset", "/reset"]:
         conversation_store.pop(from_number, None)
         resp = MessagingResponse()
-        resp.message("Conversation reset. How can I help you?")
+        resp.message("Hi! I'm your Tazapay assistant. Ask me to:\n- Check balance\n- Get FX rate\n- Create payment link\n- Check payout status" if not body else "Conversation reset.")
         return str(resp)
 
-    # Run Claude
     reply = run_claude(from_number, body)
-
-    resp = MessagingResponse()
+    resp  = MessagingResponse()
     resp.message(reply)
     return str(resp)
 
@@ -328,5 +266,5 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    logger.info(f"Starting Tazapay WhatsApp POC on port {port}")
+    logger.info(f"Starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
