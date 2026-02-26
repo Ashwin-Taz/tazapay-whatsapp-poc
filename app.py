@@ -2,13 +2,13 @@
 Tazapay WhatsApp POC
 --------------------
 WhatsApp (Twilio) → Flask webhook → Claude AI + Tazapay tools → WhatsApp reply
+Auth: Basic Auth (base64 API_KEY:API_SECRET)
+URL:  https://service-sandbox.tazapay.com (sandbox) or https://service.tazapay.com (live)
 """
 
 import os
 import json
-import hmac
-import hashlib
-import datetime
+import base64
 import logging
 import requests
 import urllib3
@@ -26,14 +26,17 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
-TWILIO_ACCOUNT_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN", "")
+ANTHROPIC_API_KEY      = os.getenv("ANTHROPIC_API_KEY", "")
+TWILIO_ACCOUNT_SID     = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN      = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-TAZAPAY_API_KEY      = os.getenv("TAZAPAY_API_KEY", "")
-TAZAPAY_API_SECRET   = os.getenv("TAZAPAY_API_SECRET", "")
-TAZAPAY_BASE_URL     = os.getenv("TAZAPAY_BASE_URL", "https://service-sandbox.tazapay.com")
-AUTHORIZED_NUMBERS   = [n.strip() for n in os.getenv("AUTHORIZED_NUMBERS", "").split(",") if n.strip()]
+TAZAPAY_API_KEY        = os.getenv("TAZAPAY_API_KEY", "")
+TAZAPAY_API_SECRET     = os.getenv("TAZAPAY_API_SECRET", "")
+# Use sandbox URL for testing, live URL for production
+# Sandbox: https://service-sandbox.tazapay.com
+# Live:    https://service.tazapay.com
+TAZAPAY_BASE_URL       = os.getenv("TAZAPAY_BASE_URL", "https://service-sandbox.tazapay.com")
+AUTHORIZED_NUMBERS     = [n.strip() for n in os.getenv("AUTHORIZED_NUMBERS", "").split(",") if n.strip()]
 
 # ---------------------------------------------------------------------------
 # In-memory conversation store
@@ -41,38 +44,39 @@ AUTHORIZED_NUMBERS   = [n.strip() for n in os.getenv("AUTHORIZED_NUMBERS", "").s
 conversation_store: dict = {}
 
 # ---------------------------------------------------------------------------
-# Tazapay API helpers — Basic Auth (API_KEY:API_SECRET base64 encoded)
+# Tazapay API — Basic Auth
 # ---------------------------------------------------------------------------
+def tazapay_auth_header() -> str:
+    token = base64.b64encode(f"{TAZAPAY_API_KEY}:{TAZAPAY_API_SECRET}".encode()).decode()
+    return f"Basic {token}"
+
 def tazapay_get(path: str) -> dict:
-    url = f"{TAZAPAY_BASE_URL}{path}"
-    resp = requests.get(url, auth=(TAZAPAY_API_KEY, TAZAPAY_API_SECRET),
-                        headers={"Content-Type": "application/json"},
-                        timeout=15, verify=False)
-    logger.info(f"Tazapay GET {path} → {resp.status_code}: {resp.text[:300]}")
+    url  = f"{TAZAPAY_BASE_URL}{path}"
+    hdrs = {"Authorization": tazapay_auth_header(), "Content-Type": "application/json"}
+    resp = requests.get(url, headers=hdrs, timeout=15, verify=False)
+    logger.info(f"GET {path} → {resp.status_code}: {resp.text[:300]}")
     resp.raise_for_status()
     return resp.json()
 
 def tazapay_post(path: str, payload: dict) -> dict:
-    url = f"{TAZAPAY_BASE_URL}{path}"
-    resp = requests.post(url, auth=(TAZAPAY_API_KEY, TAZAPAY_API_SECRET),
-                         json=payload,
-                         headers={"Content-Type": "application/json"},
-                         timeout=15, verify=False)
-    logger.info(f"Tazapay POST {path} → {resp.status_code}: {resp.text[:300]}")
+    url  = f"{TAZAPAY_BASE_URL}{path}"
+    hdrs = {"Authorization": tazapay_auth_header(), "Content-Type": "application/json"}
+    resp = requests.post(url, headers=hdrs, json=payload, timeout=15, verify=False)
+    logger.info(f"POST {path} → {resp.status_code}: {resp.text[:300]}")
     resp.raise_for_status()
     return resp.json()
 
 # ---------------------------------------------------------------------------
-# Tool definitions for Claude
+# Tool definitions
 # ---------------------------------------------------------------------------
 TOOLS = [
     {
         "name": "check_balance",
-        "description": "Fetch the merchant's Tazapay wallet balances. Optionally filter by currency (e.g. USD). Returns all balances if no currency specified.",
+        "description": "Fetch the merchant's Tazapay wallet balances. Optionally filter by a specific currency (e.g. USD).",
         "input_schema": {
             "type": "object",
             "properties": {
-                "currency": {"type": "string", "description": "Optional 3-letter ISO currency code e.g. USD"}
+                "currency": {"type": "string", "description": "Optional ISO currency code e.g. USD"}
             },
             "required": [],
         },
@@ -134,15 +138,14 @@ def execute_tool(name: str, inp: dict) -> str:
         if name == "check_balance":
             currency = inp.get("currency", "").upper()
             data = tazapay_get("/v3/balance" + (f"?currency={currency}" if currency else ""))
-            raw = data.get("data", data)
+            raw  = data.get("data", data)
             if isinstance(raw, dict) and "balances" in raw:
                 raw = raw["balances"]
             if isinstance(raw, dict):
                 active = {k: v for k, v in raw.items() if float(v or 0) != 0}
                 zero   = [k for k, v in raw.items() if float(v or 0) == 0]
                 if active:
-                    lines  = [f"{k}: {v}" for k, v in active.items()]
-                    result = "Active balances:\n" + "\n".join(lines)
+                    result = "Active balances:\n" + "\n".join(f"{k}: {v}" for k, v in active.items())
                     if zero:
                         result += f"\nZero: {', '.join(zero)}"
                 else:
@@ -152,9 +155,10 @@ def execute_tool(name: str, inp: dict) -> str:
             return result
 
         elif name == "get_fx_rate":
-            fc, tc, amt = inp["from_currency"].upper(), inp["to_currency"].upper(), int(inp["amount"])
-            data = tazapay_get(f"/v3/fx?from={fc}&to={tc}&amount={amt}")
-            raw  = data.get("data", data)
+            fc, tc = inp["from_currency"].upper(), inp["to_currency"].upper()
+            amt    = int(inp["amount"])
+            data   = tazapay_get(f"/v3/fx?from={fc}&to={tc}&amount={amt}")
+            raw    = data.get("data", data)
             rate      = raw.get("rate") if isinstance(raw, dict) else data.get("rate")
             converted = raw.get("converted_amount") if isinstance(raw, dict) else data.get("converted_amount")
             return f"FX Rate: 1 {fc} = {rate} {tc}\n{amt} {fc} = {converted} {tc}"
@@ -162,12 +166,12 @@ def execute_tool(name: str, inp: dict) -> str:
         elif name == "create_payment_link":
             payload = {
                 "customer_details": {
-                    "name": inp["customer_name"],
-                    "email": inp["customer_email"],
+                    "name":    inp["customer_name"],
+                    "email":   inp["customer_email"],
                     "country": inp["customer_country"],
                 },
-                "invoice_currency": inp["currency"].upper(),
-                "amount": inp["amount"],
+                "invoice_currency":       inp["currency"].upper(),
+                "amount":                 inp["amount"],
                 "transaction_description": inp["description"],
                 "success_url": "https://tazapay.com/success",
                 "cancel_url":  "https://tazapay.com/cancel",
@@ -242,7 +246,7 @@ def run_claude(phone: str, message: str) -> str:
 def webhook():
     from_number = request.form.get("From", "")
     body        = request.form.get("Body", "").strip()
-    logger.info(f"Incoming message from {from_number}: {body}")
+    logger.info(f"Incoming from {from_number}: {body}")
 
     if AUTHORIZED_NUMBERS and from_number not in AUTHORIZED_NUMBERS:
         resp = MessagingResponse()
@@ -251,8 +255,9 @@ def webhook():
 
     if not body or body.lower() in ["reset", "/reset"]:
         conversation_store.pop(from_number, None)
+        msg = "Hi! I'm your Tazapay assistant. Ask me to:\n- Check balance\n- Get FX rate\n- Create payment link\n- Check payout status" if not body else "Conversation reset."
         resp = MessagingResponse()
-        resp.message("Hi! I'm your Tazapay assistant. Ask me to:\n- Check balance\n- Get FX rate\n- Create payment link\n- Check payout status" if not body else "Conversation reset.")
+        resp.message(msg)
         return str(resp)
 
     reply = run_claude(from_number, body)
