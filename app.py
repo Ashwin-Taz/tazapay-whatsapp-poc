@@ -35,7 +35,7 @@ TAZAPAY_API_SECRET     = os.getenv("TAZAPAY_API_SECRET", "")
 # Use sandbox URL for testing, live URL for production
 # Sandbox: https://service-sandbox.tazapay.com
 # Live:    https://service.tazapay.com
-TAZAPAY_BASE_URL       = os.getenv("TAZAPAY_BASE_URL", "https://service.tazapay.com")
+TAZAPAY_BASE_URL       = os.getenv("TAZAPAY_BASE_URL", "https://service-sandbox.tazapay.com")
 AUTHORIZED_NUMBERS     = [n.strip() for n in os.getenv("AUTHORIZED_NUMBERS", "").split(",") if n.strip()]
 
 # ---------------------------------------------------------------------------
@@ -138,14 +138,22 @@ def execute_tool(name: str, inp: dict) -> str:
         if name == "check_balance":
             currency = inp.get("currency", "").upper()
             data = tazapay_get("/v3/balance" + (f"?currency={currency}" if currency else ""))
-            raw  = data.get("data", data)
-            if isinstance(raw, dict) and "balances" in raw:
-                raw = raw["balances"]
-            if isinstance(raw, dict):
-                active = {k: v for k, v in raw.items() if float(v or 0) != 0}
-                zero   = [k for k, v in raw.items() if float(v or 0) == 0]
+            raw = data.get("data", data)
+            # Response shape: {"available": [{"amount": 95679, "currency": "USD"}, ...]}
+            if isinstance(raw, dict) and "available" in raw:
+                items = raw["available"]
+            elif isinstance(raw, list):
+                items = raw
+            else:
+                items = []
+
+            if items:
+                active = [i for i in items if float(i.get("amount", 0)) != 0]
+                zero   = [i["currency"] for i in items if float(i.get("amount", 0)) == 0]
                 if active:
-                    result = "Active balances:\n" + "\n".join(f"{k}: {v}" for k, v in active.items())
+                    result = "Active balances:\n" + "\n".join(
+                        f"{i['currency']}: {i['amount']/100:.2f}" for i in active
+                    )
                     if zero:
                         result += f"\nZero: {', '.join(zero)}"
                 else:
